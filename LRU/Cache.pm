@@ -139,18 +139,21 @@ sub download_asset {
     if($tx->res->code == 304){
         if(toggle_asset_lock($asset, 0)){
             say "CACHE: Content has not changed, not downloading the $asset but updating last use";
+        } else {
+            say "Abnormal situation";
         }
     } elsif ($tx->res->is_success) {
         $etag = $headers->etag;
         unlink($asset);
         # $asset is now Mojo::AssetFile;
         $asset = $tx->res->content->asset->move_to($asset)->path;
-        my $size = (stat $asset->path)[7];
-        if($size == $headers->{content_length}){
+        my $size = (stat $asset)[7];
+        if($size == $headers->content_length){
             update_asset($asset, $etag, $size);
             say $log "CACHE: Asset download sucessful to $asset";
         } else {
-            say $log "CACHE: Size of $asset differs, Expected: ".$headers->size." / Downloaded ".$size;
+            say Dumper($headers);
+            say $log "CACHE: Size of $asset differs, Expected: ".$headers->content_length." / Downloaded ".$size;
             $asset = undef;
         }
     } else {
@@ -163,22 +166,38 @@ sub download_asset {
 
 sub toggle_asset_lock {
     my ($asset, $toggle) = @_;
-    my $sql = "REPLACE INTO assets (downloading,filename,last_use) VALUES (?, ?, strftime('%s','now'));";
-    
+    my $sql = "UPDATE assets set downloading = ?, filename=?, last_use = strftime('%s','now') where filename = ?;";
+
+    eval {
+        $dbh->prepare($sql)->execute($toggle, $asset, $asset) or die $dbh->errstr;
+    };
+
+    if($@) {
+        $dbh->rollback;
+        die "Rolling back $@";
+    } else {
+        $dbh->commit;
+        return 1;
+    }
+
+}
+
+sub add_asset {
+    my ($asset, $toggle) = @_;
+    my $sql = "INSERT INTO assets (downloading,filename,last_use) VALUES (?, ?, strftime('%s','now'));";
+
     eval {
         $dbh->prepare($sql)->execute($toggle, $asset) or die $dbh->errstr;
     };
 
     if($@) {
-        say "Rolling back $@";
         $dbh->rollback;
-        return 0;
+        die "Rolling back $@";
     } else {
         $dbh->commit;
-        return $toggle;
+        return 1;
     }
 
-    return $toggle;
 }
 
 sub try_lock_asset {
@@ -193,9 +212,9 @@ sub try_lock_asset {
         $sql = "SELECT (last_use > strftime('%s','now') - 60 and downloading = 1 and etag != '') as is_fresh, etag from assets where filename = ?";
         $sth = $dbh->prepare($sql);
         $result = $dbh->selectrow_hashref($sql, undef, $asset);
-        say Dumper(\$result);
-
-        if (!$result || !$result->{is_fresh}){
+        if (!$result){
+            add_asset($asset);
+        } elsif (!$result->{is_fresh}){
             $lock_granted = toggle_asset_lock($asset, 1);
         } elsif ($result->{is_fresh} == 1) {
             say "Being downloaded by another worker, sleeping.";
