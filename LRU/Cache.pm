@@ -38,21 +38,29 @@ END {
     $dbh->disconnect();
 }
 
+sub deploy_db {
+    local $/;
+    my $sql= <DATA>;
+    say "Deploying DB: $sql";
+    $dbh = DBI->connect($dsn, undef, undef, { RaiseError => 1,  PrintError => 1, AutoCommit => 0}) or die ("Could not connect to the dbfile.");
+    $dbh->do($sql);
+    $dbh->commit;
+    $dbh->disconnect;
+}
+
 sub init {
     my $class;
     ($host, $location) = @_;
     $db_file = catdir($location, 'cache.db');
-    deploy_db unless ( -e $db_file );
     $dsn = "dbi:SQLite:dbname=$db_file";
+    deploy_db unless ( -e $db_file );
+    
     $dbh = DBI->connect($dsn, undef, undef, { RaiseError => 1,  PrintError => 1, AutoCommit => 0}) or die ("Could not connect to the dbfile.");
     $dbh->{RaiseError} = 1;
     say(__PACKAGE__ . ": Initialized with $host at $location");
 }
 
-sub deploy_db {
-    say "Deploying DB";
-    ...
-}
+
 
 sub update_asset {
     my ($asset, $etag, $size) = @_;
@@ -96,7 +104,6 @@ sub download_asset {
     my $tx = $ua->build_tx(GET => $url);
     my $headers;
 
-    local $|=1;
     $ua->on(
         start => sub {
             my ($ua, $tx) = @_;
@@ -106,6 +113,7 @@ sub download_asset {
             $tx->res->on(
                 progress => sub {
                     my $msg = shift;
+                    
                     if ($msg->code == 304){
                         $msg->finish;
                     }
@@ -127,30 +135,36 @@ sub download_asset {
         });
 
     $tx = $ua->start($tx);
-    
+
     if($tx->res->code == 304){
-        $lock_granted = toggle_asset_lock($asset, 0);
-        say "CACHE: Content has not changed, not downloading the asset but updating last use";
-    } elsif (!$tx->res->is_success) {
-        say "CACHE: download of ".$asset." failed with:". $tx->res->error->{message};
-        return undef;
-    } else {
+        if(toggle_asset_lock($asset, 0)){
+            say "CACHE: Content has not changed, not downloading the $asset but updating last use";
+        }
+    } elsif ($tx->res->is_success) {
         $etag = $headers->etag;
         unlink($asset);
-        $asset = $tx->res->content->asset->move_to($asset);
+        # $asset is now Mojo::AssetFile;
+        $asset = $tx->res->content->asset->move_to($asset)->path;
         my $size = (stat $asset->path)[7];
-        update_asset($asset->path, $etag, $size);
-        say $log "CACHE: Asset download sucessful to ".$asset->path;
+        if($size == $headers->{content_length}){
+            update_asset($asset, $etag, $size);
+            say $log "CACHE: Asset download sucessful to $asset";
+        } else {
+            say $log "CACHE: Size of $asset differs, Expected: ".$headers->size." / Downloaded ".$size;
+            $asset = undef;
+        }
+    } else {
+        say "CACHE: Download of $asset failed with: ". $tx->res->error->{message};
+        $asset = undef;
     }
 
-    return $asset;
+    return $asset
 }
 
 sub toggle_asset_lock {
     my ($asset, $toggle) = @_;
-    $toggle = ($toggle)? 1 : 0;
     my $sql = "REPLACE INTO assets (downloading,filename,last_use) VALUES (?, ?, strftime('%s','now'));";
-
+    
     eval {
         $dbh->prepare($sql)->execute($toggle, $asset) or die $dbh->errstr;
     };
@@ -176,7 +190,7 @@ sub try_lock_asset {
 
     eval {
 
-        $sql = "SELECT (last_use > strftime('%s','now') - 60 and downloading = 1 and etag != 'none') as is_fresh, etag from assets where filename = ?";
+        $sql = "SELECT (last_use > strftime('%s','now') - 60 and downloading = 1 and etag != '') as is_fresh, etag from assets where filename = ?";
         $sth = $dbh->prepare($sql);
         $result = $dbh->selectrow_hashref($sql, undef, $asset);
         say Dumper(\$result);
@@ -244,3 +258,6 @@ sub expire_asset {
 }
 
 1;
+
+__DATA__
+CREATE TABLE "assets" ( `etag` TEXT, `size` INTEGER, `last_use` DATETIME NOT NULL, `downloading` boolean NOT NULL, `filename` TEXT NOT NULL UNIQUE, PRIMARY KEY(`filename`) );
