@@ -184,10 +184,10 @@ sub toggle_asset_lock {
 
 sub add_asset {
     my ($asset, $toggle) = @_;
-    my $sql = "INSERT INTO assets (downloading,filename,last_use) VALUES (?, ?, strftime('%s','now'));";
+    my $sql = "INSERT INTO assets (downloading,filename,last_use) VALUES (1, ?, strftime('%s','now'));";
 
     eval {
-        $dbh->prepare($sql)->execute($toggle, $asset) or die $dbh->errstr;
+        $dbh->prepare($sql)->execute($asset) or die $dbh->errstr;
     };
 
     if($@) {
@@ -214,6 +214,7 @@ sub try_lock_asset {
         $result = $dbh->selectrow_hashref($sql, undef, $asset);
         if (!$result){
             add_asset($asset);
+            $lock_granted = 1;
         } elsif (!$result->{is_fresh}){
             $lock_granted = toggle_asset_lock($asset, 1);
         } elsif ($result->{is_fresh} == 1) {
