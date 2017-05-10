@@ -42,10 +42,16 @@ sub init {
     my $class;
     ($host, $location) = @_;
     $db_file = catdir($location, 'cache.db');
+    deploy_db unless ( -e $db_file );
     $dsn = "dbi:SQLite:dbname=$db_file";
     $dbh = DBI->connect($dsn, undef, undef, { RaiseError => 1,  PrintError => 1, AutoCommit => 0}) or die ("Could not connect to the dbfile.");
     $dbh->{RaiseError} = 1;
     say(__PACKAGE__ . ": Initialized with $host at $location");
+}
+
+sub deploy_db {
+    say "Deploying DB";
+    ...
 }
 
 sub update_asset {
@@ -101,7 +107,6 @@ sub download_asset {
                 progress => sub {
                     my $msg = shift;
                     if ($msg->code == 304){
-                        say "CACHE: Content has not changed, not downloading the asset.";
                         $msg->finish;
                     }
 
@@ -115,31 +120,25 @@ sub download_asset {
                         $last_updated = time;
                         if ($progress < $current) {
                             $progress = $current;
-                            say $log "CACHE: Downloading $asset :", $size == $len ? 100 : $progress,"";
+                            say $log "CACHE: Downloading $asset :", $size == $len ? 100 : $progress;
                         }
                     }
                 });
         });
 
     $tx = $ua->start($tx);
-
-    if (!$tx->res->is_success) {
-        say Dumper($tx);
-        my $error_string = "CACHE: download of ".$asset." failed with: ";
-        $error_string = ($tx->res->error->{message})? $tx->res->error->{message} : $tx->res->code." ".$tx->res->message;
-        say $error_string;
-        if($tx->res->code == 304){
-            toggle_asset_lock($asset, 0);
-        }
-
-        
-        $asset = undef;
+    
+    if($tx->res->code == 304){
+        $lock_granted = toggle_asset_lock($asset, 0);
+        say "CACHE: Content has not changed, not downloading the asset but updating last use";
+    } elsif (!$tx->res->is_success) {
+        say "CACHE: download of ".$asset." failed with:". $tx->res->error->{message};
+        return undef;
     } else {
         $etag = $headers->etag;
         unlink($asset);
         $asset = $tx->res->content->asset->move_to($asset);
         my $size = (stat $asset->path)[7];
-        say "update_asset(".$asset->path.", $etag, $size)";
         update_asset($asset->path, $etag, $size);
         say $log "CACHE: Asset download sucessful to ".$asset->path;
     }
@@ -147,25 +146,17 @@ sub download_asset {
     return $asset;
 }
 
-sub get {
-    ...
-}
-
-sub update_last_used {
-    ...
-}
-
 sub toggle_asset_lock {
     my ($asset, $toggle) = @_;
     $toggle = ($toggle)? 1 : 0;
-    my $sql = "REPLACE INTO assets (downloading,filename,etag,last_use) VALUES (?, ?, 'none', strftime('%s','now'));";
+    my $sql = "REPLACE INTO assets (downloading,filename,last_use) VALUES (?, ?, strftime('%s','now'));";
 
     eval {
         $dbh->prepare($sql)->execute($toggle, $asset) or die $dbh->errstr;
     };
 
     if($@) {
-        $dbh->finish;  # You need this for SQLite
+        say "Rolling back $@";
         $dbh->rollback;
         return 0;
     } else {
@@ -176,10 +167,6 @@ sub toggle_asset_lock {
     return $toggle;
 }
 
-# INSERT INTO assets (downloading,filename) VALUES (1,"Test");
-# my $sql = "INSERT INTO assets (downloading,filename,etag,last_use) VALUES (1, $asset ,NULL, strftime('%s','now'));";
-# my @this_asset = [ $asset ];
-# my $result = $dbh->selectrow_arrayref($sql, undef, @this_asset);
 sub try_lock_asset {
     my ($asset) = @_;
     my $sth;
@@ -200,14 +187,13 @@ sub try_lock_asset {
             say "Being downloaded by another worker, sleeping.";
             $lock_granted = 0;
         } else {
-            say "Odd situation?";
-            $lock_granted = 0;
+            die "CACHE: Abnormal situation.";
         }
 
     };
 
     if($@) {
-        $dbh->finish;  # You need this for SQLite
+        say "Rolling back $@";
         $dbh->rollback;
     } else {
         if ($lock_granted){
