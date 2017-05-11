@@ -27,6 +27,7 @@ my $limit = 50;
 my $db_file = "cache.db";
 my $dsn = "";
 my $dbh;
+my $cache_real_size;
 
 ## REMOVE US!
 
@@ -58,9 +59,10 @@ sub init {
     $dbh = DBI->connect($dsn, undef, undef, { RaiseError => 1,  PrintError => 1, AutoCommit => 0}) or die ("Could not connect to the dbfile.");
     $dbh->{RaiseError} = 1;
     say(__PACKAGE__ . ": Initialized with $host at $location");
+
+    cache_cleanup();
+
 }
-
-
 
 sub update_asset {
     my ($asset, $etag, $size) = @_;
@@ -153,7 +155,6 @@ sub download_asset {
             update_asset($asset, $etag, $size);
             say $log "CACHE: Asset download sucessful to $asset";
         } else {
-            say Dumper($headers);
             say $log "CACHE: Size of $asset differs, Expected: ".$headers->content_length." / Downloaded ".$size;
             $asset = undef;
         }
@@ -189,6 +190,25 @@ sub add_asset {
 
     eval {
         $dbh->prepare($sql)->execute($asset) or die $dbh->errstr;
+    };
+
+    if($@) {
+        $dbh->rollback;
+        die "Rolling back $@";
+    } else {
+        $dbh->commit;
+        return 1;
+    }
+
+}
+
+sub purge_asset {
+    my ($asset) = @_;
+    my $sql = "DELETE FROM assets WHERE filename = ?";
+
+    eval {
+        $dbh->prepare($sql)->execute($asset) or die $dbh->errstr;
+        unlink($asset) or say "CACHE: Could not remove $asset";
     };
 
     if($@) {
@@ -274,8 +294,41 @@ sub get_asset {
     return $asset;
 }
 
-sub expire_asset {
-    ...
+sub cache_cleanup {
+    # Trust the filesystem.
+
+    my @assets = `find $location -type f -name '*.img' -o -name '*.qcow2' -o -name '*.iso'`;
+    foreach my $file (@assets){
+        my $asset_size;
+        chomp $file;
+        say "Going for $file";
+        $asset_size = (stat $file)[7];
+        $cache_real_size += $asset_size;
+        asset_lookup($file);
+    }
+
+}
+
+sub asset_lookup {
+ my ($asset) = @_;
+    my $sth;
+    my $sql;
+    my $lock_granted;
+    my $result;
+
+    eval {
+        $sql = "SELECT filename, etag, last_use, size from assets where filename = ? and downloading = 0";
+        $sth = $dbh->prepare($sql);
+        $result = $dbh->selectrow_hashref($sql, undef, $asset);
+        if (!$result){
+            say "$asset is not in the db, purging.";
+            purge_asset($asset);
+            return 0;
+        } else {
+            return $result;
+        }
+
+    };
 }
 
 1;
