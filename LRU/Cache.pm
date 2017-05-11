@@ -125,6 +125,7 @@ sub download_asset {
                     # Don't spam the webui, update only every 5 seconds
                     if (time - $last_updated > 5) {
                         #update_setup_status;
+                        toggle_asset_lock($asset, 1);
                         $last_updated = time;
                         if ($progress < $current) {
                             $progress = $current;
