@@ -160,6 +160,7 @@ sub download_asset {
         }
     } else {
         say "CACHE: Download of $asset failed with: ". $tx->res->error->{message};
+        purge_asset($asset);
         $asset = undef;
     }
 
@@ -172,6 +173,7 @@ sub toggle_asset_lock {
 
     eval {
         $dbh->prepare($sql)->execute($toggle, $asset, $asset) or die $dbh->errstr;
+        say "Setting $asset as downloading $toggle";
     };
 
     if($@) {
@@ -230,12 +232,13 @@ sub try_lock_asset {
 
     eval {
 
-        $sql = "SELECT (last_use > strftime('%s','now') - 60 and downloading = 1 and etag != '') as is_fresh, etag from assets where filename = ?";
+        $sql = "SELECT (last_use > strftime('%s','now') - 60 and downloading = 1) as is_fresh, etag from assets where filename = ?";
         $sth = $dbh->prepare($sql);
         $result = $dbh->selectrow_hashref($sql, undef, $asset);
         if (!$result){
             add_asset($asset);
             $lock_granted = 1;
+            $result = {};
         } elsif (!$result->{is_fresh}){
             $lock_granted = toggle_asset_lock($asset, 1);
         } elsif ($result->{is_fresh} == 1) {
@@ -274,14 +277,14 @@ sub get_asset {
     while () {
 
         say "CACHE: Aquiring lock for $asset in the database";
-
-        unless ($result = try_lock_asset($asset)) {
+        $result = try_lock_asset($asset);
+        if (!$result) {
             update_setup_status;
             say "CACHE: wait 5 seconds for the lock.";
             sleep 5;
             next;
-        }
-
+        } 
+        say "Lock was granted for $asset";
         $ret = download_asset($job, lc($asset_type), $asset, ($result->{etag})? $result->{etag} : undef );
 
         if (!$ret) {
