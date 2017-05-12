@@ -23,7 +23,7 @@ our (@ISA, @EXPORT);
 my $cache;
 my $host;
 my $location;
-my $limit = 50;
+my $limit = 25000000000;
 my $db_file = "cache.db";
 my $dsn = "";
 my $dbh;
@@ -57,17 +57,18 @@ sub init {
     deploy_db unless ( -e $db_file );
     
     $dbh = DBI->connect($dsn, undef, undef, { RaiseError => 1,  PrintError => 1, AutoCommit => 0}) or die ("Could not connect to the dbfile.");
-    $dbh->{RaiseError} = 1;
-    say(__PACKAGE__ . ": Initialized with $host at $location");
-
+    $cache_real_size = 0;
     cache_cleanup();
+    check_limits(0); #Ideally we only need $limit, and $need no extra space
+
+    say(__PACKAGE__ . ": Initialized with $host at $location, current size is $cache_real_size");
 
 }
 
 sub update_asset {
     my ($asset, $etag, $size) = @_;
     my $sql = "REPLACE INTO assets (downloading, filename, etag, size, last_use) VALUES (0, ?, ?, ?, strftime('%s','now'));";
-    say "updating the $asset with $etag and $size";
+    say "\tCACHE: updating the $asset with $etag and $size";
     eval {
         my $sth = $dbh->prepare($sql);
         $sth->bind_param(1, $asset);
@@ -75,6 +76,8 @@ sub update_asset {
         $sth->bind_param(3, $size);
         $sth->execute;
     };
+
+    $cache_real_size += $size;
 
     if($@){
         say "Rolling back $@";
@@ -96,9 +99,8 @@ sub download_asset {
 
     #open(my $log, '>>', "autoinst-log.txt") or die("Cannot open autoinst-log.txt");
     my $log = *STDOUT;
-    say $log "CACHE: Locking $asset";
 
-    say $log "Attemping to download: $host $asset, $type, $id";
+    say $log "\t\tAttemping to download: $host $asset, $type, $id";
     my $ua = Mojo::UserAgent->new(max_redirects => 2);
     $ua->max_response_size(0);
     my $url = sprintf '%s/tests/%d/asset/%s/%s', $host, $id, $type, basename($asset);
@@ -131,7 +133,7 @@ sub download_asset {
                         $last_updated = time;
                         if ($progress < $current) {
                             $progress = $current;
-                            say $log "CACHE: Downloading $asset :", $size == $len ? 100 : $progress;
+                            say $log "\t\tCACHE: Downloading $asset :", $size == $len ? 100 : $progress;
                         }
                     }
                 });
@@ -141,25 +143,28 @@ sub download_asset {
 
     if($tx->res->code == 304){
         if(toggle_asset_lock($asset, 0)){
-            say "CACHE: Content has not changed, not downloading the $asset but updating last use";
+            say "\t\tCACHE: Content has not changed, not downloading the $asset but updating last use";
         } else {
-            say "Abnormal situation";
+            say "CACHE: !!!Abnormal situation";
+            return undef;
         }
     } elsif ($tx->res->is_success) {
         $etag = $headers->etag;
         unlink($asset);
-        # $asset is now Mojo::AssetFile;
         $asset = $tx->res->content->asset->move_to($asset)->path;
         my $size = (stat $asset)[7];
         if($size == $headers->content_length){
+            say "\t\t\tDownload size before cleanup: $cache_real_size + $size > $limit";
+            check_limits($size); 
             update_asset($asset, $etag, $size);
-            say $log "CACHE: Asset download sucessful to $asset";
+            say "\t\t\tDownload size after cleanup: $cache_real_size + $size > $limit";
+            say $log "\t\tCACHE: Asset download sucessful to $asset";
         } else {
-            say $log "CACHE: Size of $asset differs, Expected: ".$headers->content_length." / Downloaded ".$size;
+            say $log "\t\tCACHE: Size of $asset differs, Expected: ".$headers->content_length." / Downloaded ".$size;
             $asset = undef;
         }
     } else {
-        say "CACHE: Download of $asset failed with: ". $tx->res->error->{message};
+        say "!!!!CACHE: Download of $asset failed with: ". $tx->res->error->{message};
         purge_asset($asset);
         $asset = undef;
     }
@@ -173,7 +178,6 @@ sub toggle_asset_lock {
 
     eval {
         $dbh->prepare($sql)->execute($toggle, $asset, $asset) or die $dbh->errstr;
-        say "Setting $asset as downloading $toggle";
     };
 
     if($@) {
@@ -210,7 +214,8 @@ sub purge_asset {
 
     eval {
         $dbh->prepare($sql)->execute($asset) or die $dbh->errstr;
-        unlink($asset) or say "CACHE: Could not remove $asset";
+        unlink($asset) or eval { say "CACHE: Could not remove $asset" if -e $asset };
+        say "\t\t\t\tCACHE: $asset Should have been removed";
     };
 
     if($@) {
@@ -280,11 +285,11 @@ sub get_asset {
         $result = try_lock_asset($asset);
         if (!$result) {
             update_setup_status;
-            say "CACHE: wait 5 seconds for the lock.";
+            say "\t\tCACHE: wait 5 seconds for the lock.";
             sleep 5;
             next;
         } 
-        say "Lock was granted for $asset";
+        say "\tLock was granted for $asset";
         $ret = download_asset($job, lc($asset_type), $asset, ($result->{etag})? $result->{etag} : undef );
 
         if (!$ret) {
@@ -298,16 +303,14 @@ sub get_asset {
 }
 
 sub cache_cleanup {
-    # Trust the filesystem.
-
     my @assets = `find $location -type f -name '*.img' -o -name '*.qcow2' -o -name '*.iso'`;
     foreach my $file (@assets){
         my $asset_size;
         chomp $file;
-        say "Going for $file";
         $asset_size = (stat $file)[7];
-        $cache_real_size += $asset_size;
-        asset_lookup($file);
+        say "\t\t\t\tSizes were: $cache_real_size + $asset_size for $file";
+        $cache_real_size += $asset_size if asset_lookup($file);
+        say "\t\t\t\tSum: $cache_real_size + $asset_size for $file";
     }
 
 }
@@ -324,7 +327,7 @@ sub asset_lookup {
         $sth = $dbh->prepare($sql);
         $result = $dbh->selectrow_hashref($sql, undef, $asset);
         if (!$result){
-            say "$asset is not in the db, purging.";
+            say "\t\t\t\t\t$asset is not in the db, purging.";
             purge_asset($asset);
             return 0;
         } else {
@@ -334,7 +337,46 @@ sub asset_lookup {
     };
 }
 
+sub check_limits {
+    # Trust the filesystem.
+    my ($needed) = @_;
+    my $sql;
+    my $sth;
+    my $result;
+
+    my $wanted_size = $cache_real_size+$needed;
+    say "\t\t\t\twhile $wanted_size ($cache_real_size + $needed < $limit)){";
+    while ($cache_real_size + $needed > $limit){
+        $sql = "SELECT size, filename FROM assets WHERE downloading = 0 ORDER BY last_use desc";
+        $sth = $dbh->prepare($sql);
+        $result = $dbh->selectrow_hashref($sql);
+
+        foreach my $asset ($result){
+            if(purge_asset($asset->{filename})){
+                say "\t\t\t\t****";
+                say "\t\t\t\tWill free up ".$asset->{size}." from $cache_real_size to make space for $limit";
+                $cache_real_size -= $asset->{size};
+                say "\t\t\t\tFreed up".$asset->{size}." from $cache_real_size to make space for $limit";
+                say "\t\t\t\t****";
+            } else {
+                say "!!!!!!!Something went wrong";
+            }
+            say "\t\t\t\t****";
+            say "\t\t\t\t****";
+            say "\t\t\t\tNow size is $cache_real_size + $needed < $limit";
+            last if ($cache_real_size < $limit);
+            say "\t\t\t\tCACHE: All ok, $cache_real_size, $limit: ". ($cache_real_size < $limit);
+            say "\t\t\t\t****";
+            say "\t\t\t\t****";
+        }
+
+
+    }
+        say "CACHE: All ok, $cache_real_size, $limit: ". ($cache_real_size < $limit);
+}
+
 1;
 
 __DATA__
 CREATE TABLE "assets" ( `etag` TEXT, `size` INTEGER, `last_use` DATETIME NOT NULL, `downloading` boolean NOT NULL, `filename` TEXT NOT NULL UNIQUE, PRIMARY KEY(`filename`) );
+
